@@ -1,0 +1,30 @@
+[Unit]
+Description=Robot Command Controller (LLM-powered)
+After=network.target mongod.service mosquitto.service llama-server.service
+Requires=mongod.service mosquitto.service
+Wants=llama-server.service
+
+[Service]
+Type=simple
+User=jetson
+Group=jetson
+WorkingDirectory=/home/jetson/robot-controller
+Environment=APP_LOG_LEVEL=INFO
+Environment=APP_LOG_FORMAT=json
+Environment=APP_ROBOT_ID=robot-01
+Environment=MQTT_HOST=localhost
+Environment=MONGO_URI=mongodb://localhost:27017
+Environment=LLM_BASE_URL=http://localhost:8080
+ExecStart=/home/jetson/robot-controller/.venv/bin/python -m src.main
+Restart=on-failure
+RestartSec=5
+MemoryMax=2G
+StandardOutput=journal
+StandardError=journal
+
+# Graceful shutdown: send SIGTERM, wait 30s, then SIGKILL
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

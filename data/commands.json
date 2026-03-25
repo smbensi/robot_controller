@@ -1,0 +1,140 @@
+{
+  "commands": [
+    {
+      "name": "call",
+      "spellings": ["call", "called", "cold", "ring", "phone"],
+      "sequence": ["WAKEWORD", "call"],
+      "n_slots": 1,
+      "slots_type": ["users"]
+    },
+    {
+      "name": "vitals",
+      "spellings": ["take vitals", "vitals"],
+      "sequence": ["WAKEWORD", "vitals"],
+      "n_slots": 0,
+      "slots_type": []
+    },
+    {
+      "name": "camera",
+      "spellings": ["open camera", "camera"],
+      "sequence": ["WAKEWORD", "camera"],
+      "n_slots": 0,
+      "slots_type": []
+    },
+    {
+      "name": "photo",
+      "spellings": ["take a photo", "photo", "picture"],
+      "sequence": ["WAKEWORD", "photo"],
+      "n_slots": 0,
+      "slots_type": []
+    },
+    {
+      "name": "dictation",
+      "spellings": ["dictation", "record", "notes"],
+      "sequence": ["WAKEWORD", "dictation"],
+      "n_slots": 0,
+      "slots_type": []
+    },
+    {
+            "name": "register",
+            "spellings": [
+                "register",
+                "registered",
+                "signin",
+                "sign in"
+            ],
+            "sequence": [
+                "WAKEWORD",
+                "register"
+            ],
+            "n_slots": 0,
+            "slots_type": []
+        },
+        {
+            "name" : "dock",
+            "spellings" : ["dock","duck", "charge"],
+            "sequence": [
+                "WAKEWORD",
+                "dock"
+            ],
+            "n_slots" : 0,
+            "slots_type" : []
+        },
+        {
+            "name": "goto",
+            "spellings": [
+                "go to",
+                "come to",
+                "goto",
+                "go"
+            ],
+            "sequence": [
+                "WAKEWORD",
+                "go to"
+            ],
+            "n_slots": 1,
+            "slots_type": [
+                "locations",
+                "users"
+            ]
+        },
+        {
+            "name": "cancel",
+            "spellings": [
+                "cancel",
+                "concil",
+                "councel",
+                "consel",
+                "quit",
+                "abort",
+                "exit"
+            ],
+            "sequence": [
+                "WAKEWORD",
+                "cancel"
+            ],
+            "n_slots": 0,
+            "slots_type": []
+        },
+        {
+            "name": "save",
+            "spellings": [
+                "save",
+                "saved"
+            ],
+            "sequence": [
+                "WAKEWORD",
+                "save"
+            ],
+            "n_slots": 0,
+            "slots_type": []
+        },
+        {
+            "name": "start",
+            "spellings": [
+                "start",
+                "begin"
+            ],
+            "sequence": [
+                "WAKEWORD",
+                "start"
+            ],
+            "n_slots": 0,
+            "slots_type": []
+        },
+        {
+            "name": "end_dictation",
+            "spellings": [
+                "end dictation",
+                "stop"
+            ],
+            "sequence": [
+                "WAKEWORD",
+                "stop",
+                "dictation"
+            ],
+            "n_slots": 0,
+            "slots_type": []
+        }
+  ]
+}

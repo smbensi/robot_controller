@@ -1,0 +1,46 @@
+# GBNF Grammar for Robot Command Extraction
+# This grammar constrains the LLM to only produce valid JSON matching our schema.
+# llama-server applies this at the token level during decoding.
+
+root ::= "{" ws members ws "}"
+
+members ::= commands-member "," ws conversation-member "," ws response-member
+
+commands-member ::= "\"commands\"" ws ":" ws "[" ws command-list? ws "]"
+conversation-member ::= "\"is_conversation\"" ws ":" ws boolean
+response-member ::= "\"conversation_response\"" ws ":" ws (string | "null")
+
+command-list ::= command ("," ws command)*
+
+command ::= simple-command | conditional-command
+
+simple-command ::= "{" ws
+  "\"command\"" ws ":" ws cmd-name "," ws
+  "\"data_type\"" ws ":" ws string "," ws
+  "\"data\"" ws ":" ws string "," ws
+  "\"status\"" ws ":" ws status-val
+ws "}"
+
+conditional-command ::= "{" ws
+  "\"command\"" ws ":" ws "\"conditional\"" "," ws
+  "\"condition\"" ws ":" ws string "," ws
+  "\"then_commands\"" ws ":" ws "[" ws simple-command-list ws "]" "," ws
+  "\"else_commands\"" ws ":" ws ("[" ws simple-command-list ws "]" | "null") "," ws
+  "\"status\"" ws ":" ws status-val
+ws "}"
+
+simple-command-list ::= simple-command ("," ws simple-command)*
+
+# Command names — extend this list when adding new commands
+cmd-name ::= "\"call\"" | "\"vitals\"" | "\"camera\"" | "\"photo\"" | "\"dictation\"" | "\"conditional\""
+
+status-val ::= "\"pending\"" | "\"active\"" | "\"completed\"" | "\"error\""
+
+boolean ::= "true" | "false"
+
+string ::= "\"" chars "\""
+chars ::= char*
+char ::= [^"\\] | "\\" escape-char
+escape-char ::= "\"" | "\\" | "/" | "b" | "f" | "n" | "r" | "t"
+
+ws ::= [ \t\n\r]*

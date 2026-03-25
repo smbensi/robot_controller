@@ -1,0 +1,22 @@
+[Unit]
+Description=llama-server (Qwen2.5-7B Q4_K_M)
+After=network.target
+
+[Service]
+Type=simple
+User=jetson
+Group=jetson
+ExecStartPre=/usr/sbin/nvpmodel -m 0
+ExecStartPre=/usr/bin/jetson_clocks
+ExecStart=/home/jetson/llama.cpp/build/bin/llama-server \
+    --model /home/jetson/models/qwen2.5-7b-instruct-q4_k_m.gguf \
+    --host 0.0.0.0 --port 8080 \
+    --jinja -fa --ngl 99 -c 4096 -t 4 --no-mmap --log-disable
+Restart=on-failure
+RestartSec=10
+MemoryMax=8G
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
