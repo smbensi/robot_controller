@@ -23,7 +23,7 @@ class CommandDefinition(BaseModel):
 
     name: str
     spellings: List[str]
-    sequence: List[str]
+    # sequence: List[str]
     n_slots: int
     slots_type: List[str]
 

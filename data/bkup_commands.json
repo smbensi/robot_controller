@@ -3,30 +3,35 @@
     {
       "name": "call",
       "spellings": ["call", "called", "cold", "ring", "phone"],
+      "sequence": ["WAKEWORD", "call"],
       "n_slots": 1,
       "slots_type": ["users"]
     },
     {
       "name": "vitals",
       "spellings": ["take vitals", "vitals"],
+      "sequence": ["WAKEWORD", "vitals"],
       "n_slots": 0,
       "slots_type": []
     },
     {
       "name": "camera",
       "spellings": ["open camera", "camera"],
+      "sequence": ["WAKEWORD", "camera"],
       "n_slots": 0,
       "slots_type": []
     },
     {
       "name": "photo",
       "spellings": ["take a photo", "photo", "picture"],
+      "sequence": ["WAKEWORD", "photo"],
       "n_slots": 0,
       "slots_type": []
     },
     {
       "name": "dictation",
       "spellings": ["dictation", "record", "notes"],
+      "sequence": ["WAKEWORD", "dictation"],
       "n_slots": 0,
       "slots_type": []
     },
@@ -38,12 +43,20 @@
                 "signin",
                 "sign in"
             ],
+            "sequence": [
+                "WAKEWORD",
+                "register"
+            ],
             "n_slots": 0,
             "slots_type": []
         },
         {
             "name" : "dock",
             "spellings" : ["dock","duck", "charge"],
+            "sequence": [
+                "WAKEWORD",
+                "dock"
+            ],
             "n_slots" : 0,
             "slots_type" : []
         },
@@ -54,6 +67,10 @@
                 "come to",
                 "goto",
                 "go"
+            ],
+            "sequence": [
+                "WAKEWORD",
+                "go to"
             ],
             "n_slots": 1,
             "slots_type": [
@@ -72,6 +89,10 @@
                 "abort",
                 "exit"
             ],
+            "sequence": [
+                "WAKEWORD",
+                "cancel"
+            ],
             "n_slots": 0,
             "slots_type": []
         },
@@ -80,6 +101,10 @@
             "spellings": [
                 "save",
                 "saved"
+            ],
+            "sequence": [
+                "WAKEWORD",
+                "save"
             ],
             "n_slots": 0,
             "slots_type": []
@@ -90,6 +115,10 @@
                 "start",
                 "begin"
             ],
+            "sequence": [
+                "WAKEWORD",
+                "start"
+            ],
             "n_slots": 0,
             "slots_type": []
         },
@@ -98,6 +127,11 @@
             "spellings": [
                 "end dictation",
                 "stop"
+            ],
+            "sequence": [
+                "WAKEWORD",
+                "stop",
+                "dictation"
             ],
             "n_slots": 0,
             "slots_type": []
