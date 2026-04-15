@@ -133,6 +133,18 @@ class MQTTAdapter:
             n_commands=len(response.commands),
         )
 
+    @property
+    def chat_stream_topic(self) -> str:
+        return f"robot/{self._robot_id}/chat/stream"
+
+    async def publish_chat_chunk(self, tid: str, chunk: str, done: bool = False) -> None:
+        """Publish a streaming chunk (or the done signal) for a conversational response."""
+        if self._client is None:
+            return
+        payload = json.dumps({"transaction_id": tid, "chunk": chunk, "done": done})
+        # QoS 0 — fire-and-forget, speed matters more than delivery guarantee for chunks
+        await self._client.publish(f"{self.chat_stream_topic}/{tid}", payload, qos=0)
+
     async def publish_chat(self, tid: str, text: str) -> None:
         """Publish a conversational response."""
         if self._client is None:

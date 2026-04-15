@@ -1,100 +1,245 @@
 """
 LLM Adapter: interfaces with llama-server's OpenAI-compatible API.
-Handles prompt construction, GBNF grammar loading, and response parsing.
+Uses /v1/chat/completions with Qwen2.5 tool calling.
 
-The system prompt is loaded from an external template file (data/system_prompt.txt)
-and injected with command definitions from commands.json at startup.
-Edit the template to change the LLM's behavior without modifying code.
+Tool design — three tools total:
+  - execute_commands: single tool that takes an ARRAY of robot commands.
+    Using one tool for all commands (instead of one tool per command) avoids
+    the reliability problem where Qwen only calls one tool out of many.
+  - conditional: for if/then/else robot logic.
+  - <data tools>: fetch real-time data (weather, etc.); result is fed back to
+    Qwen so it can speak a natural-language answer.
+
+To add a new data tool:
+  1. Add its JSON schema to _DATA_TOOLS.
+  2. Add a handler branch in _execute_data_tool().
 """
 
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
-from typing import List
+from typing import AsyncGenerator, List
 
 import httpx
 
 from src.config import AppSettings
-from src.models import CommandBatch, CommandDefinition, SimpleCommand, ConditionalCommand
+from src.models import CommandBatch, CommandDefinition, ConditionalCommand, SimpleCommand
 from src.utils import get_logger
 
 logger = get_logger(__name__)
 
+# ---------------------------------------------------------------------------
+# Data tool definitions (non-robot tools that fetch real-time information)
+# ---------------------------------------------------------------------------
+
+_DATA_TOOLS: list[dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get current weather conditions for a city or location.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "City name or location, e.g. 'New York' or 'London'.",
+                    }
+                },
+                "required": ["location"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_time",
+            "description": "Get the current local date and time.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_news",
+            "description": (
+                "Get the latest news headlines. "
+                "Supports any search term: country ('Israel'), topic ('health'), keyword ('earthquake'), etc. "
+                "Leave query empty for general top headlines."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Optional search term, e.g. 'Israel', 'health', 'technology'. Empty for top headlines.",
+                    }
+                },
+                "required": [],
+            },
+        },
+    },
+]
+
+_MAX_TOOL_ROUNDS = 5  # Prevent infinite tool-call loops
+
 
 class LLMAdapter:
-    """Async adapter for llama-server with grammar-constrained decoding."""
+    """Async adapter for llama-server using OpenAI-compatible tool calling."""
 
     def __init__(self, settings: AppSettings, command_defs: List[CommandDefinition]) -> None:
         self._settings = settings.llm
         self._command_defs = command_defs
-        self._grammar = self._load_file(settings.llm.grammar_path, "gbnf_grammar")
+        self._robot_command_names = {d.name for d in command_defs}
+        self._cmd_lookup = {d.name: d for d in command_defs}
+        self._tools = self._build_tools()
         self._system_prompt = self._build_system_prompt(settings.llm.system_prompt_path)
         self._client = httpx.AsyncClient(
             base_url=self._settings.base_url,
             timeout=httpx.Timeout(self._settings.timeout),
         )
+        # Conversation history — only used for conversational turns, not robot commands.
+        # Safe without locking: max_concurrent_llm=1 serialises all LLM calls.
+        self._history: list[dict] = []
+        self._max_history_msgs: int = settings.llm.max_history_pairs * 2
 
     # ------------------------------------------------------------------ #
-    #  Prompt & file loading                                              #
+    #  Tool & prompt construction                                          #
     # ------------------------------------------------------------------ #
 
-    @staticmethod
-    def _load_file(path: str, label: str) -> str | None:
-        """Load a text file from disk. Returns None if not found."""
-        file_path = Path(path)
-        if file_path.exists():
-            content = file_path.read_text(encoding="utf-8")
-            logger.info(f"{label}_loaded", path=str(file_path), size=len(content))
-            return content
-        logger.warning(f"{label}_not_found", path=str(file_path))
-        return None
+    def _build_tools(self) -> list[dict]:
+        """
+        Build the tools list:
+          - execute_commands: one tool, array of commands (avoids multi-tool reliability issues)
+          - conditional: for if/then/else logic
+          - data tools (weather, etc.)
+        """
+        cmd_names = sorted(self._robot_command_names)
+
+        # Inline command descriptions so Qwen knows spellings and slot requirements
+        cmd_desc_lines = []
+        for cmd in self._command_defs:
+            slot_note = f" (slot: {', '.join(cmd.slots_type)})" if cmd.slots_type else ""
+            cmd_desc_lines.append(
+                f'  "{cmd.name}": triggered by {", ".join(cmd.spellings)}{slot_note}'
+            )
+        cmd_descriptions = "\n".join(cmd_desc_lines)
+
+        # Shared sub-command item schema (reused in execute_commands and conditional)
+        sub_cmd_schema: dict = {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "enum": cmd_names,
+                    "description": "Robot command name.",
+                },
+                "data": {
+                    "type": "string",
+                    "description": "Slot value if the command requires one (e.g. person name, location).",
+                },
+            },
+            "required": ["command"],
+        }
+
+        tools: list[dict] = [
+            # ---- execute_commands ----------------------------------------
+            {
+                "type": "function",
+                "function": {
+                    "name": "execute_commands",
+                    "description": (
+                        "Execute one or more robot commands. "
+                        "Include ALL commands the user requested in a single call — never split them. "
+                        "If the input matches a command spelling, call this tool immediately — do NOT ask for clarification.\n"
+                        f"Available commands:\n{cmd_descriptions}"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "commands": {
+                                "type": "array",
+                                "description": "All commands to execute, in the order mentioned.",
+                                "items": sub_cmd_schema,
+                                "minItems": 1,
+                            }
+                        },
+                        "required": ["commands"],
+                    },
+                },
+            },
+            # ---- conditional ---------------------------------------------
+            {
+                "type": "function",
+                "function": {
+                    "name": "conditional",
+                    "description": (
+                        "Queue commands that run only when a condition is met. "
+                        "Use when the user says 'if', 'when', 'only if', 'otherwise', etc."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "condition": {
+                                "type": "string",
+                                "description": "Clear description of the trigger condition.",
+                            },
+                            "then_commands": {
+                                "type": "array",
+                                "description": "Commands to run when the condition is true.",
+                                "items": sub_cmd_schema,
+                            },
+                            "else_commands": {
+                                "type": "array",
+                                "description": "Commands to run when the condition is false (omit if not needed).",
+                                "items": sub_cmd_schema,
+                            },
+                        },
+                        "required": ["condition", "then_commands"],
+                    },
+                },
+            },
+        ]
+
+        tools.extend(_DATA_TOOLS)
+        logger.info(
+            "tools_built",
+            n_robot_commands=len(self._command_defs),
+            n_data_tools=len(_DATA_TOOLS),
+        )
+        return tools
 
     def _build_system_prompt(self, template_path: str) -> str:
-        """
-        Build the system prompt by:
-          1. Loading the external template from data/system_prompt.txt
-          2. Generating the commands block from commands.json definitions
-          3. Replacing the {{COMMANDS_BLOCK}} placeholder in the template
-
-        To customize the LLM's behavior, edit data/system_prompt.txt directly.
-        The placeholder {{COMMANDS_BLOCK}} is auto-populated — do not remove it.
-        """
-        # --- Generate the commands block from definitions ---
+        """Load the system prompt template and inject the commands block."""
         cmd_lines = []
         for cmd in self._command_defs:
             slots_info = ""
             if cmd.n_slots > 0:
                 slots_info = (
-                    f" | Requires {cmd.n_slots} slot(s) of type: "
-                    f"{', '.join(cmd.slots_type)}"
+                    f" | requires slot of type: {', '.join(cmd.slots_type)}"
                 )
             spellings = ", ".join(f'"{s}"' for s in cmd.spellings)
-            cmd_lines.append(
-                f'  - "{cmd.name}": triggered by [{spellings}]{slots_info}'
-            )
+            cmd_lines.append(f'  - "{cmd.name}": [{spellings}]{slots_info}')
 
         commands_block = "\n".join(cmd_lines)
 
-        # --- Load the template ---
-        template = self._load_file(template_path, "system_prompt_template")
-
-        if template is None:
-            logger.error(
-                "system_prompt_template_missing",
-                path=template_path,
-                hint="Create data/system_prompt.txt with {{COMMANDS_BLOCK}} placeholder.",
-            )
-            # Hard fallback: minimal functional prompt
+        file_path = Path(template_path)
+        if not file_path.exists():
+            logger.warning("system_prompt_template_not_found", path=template_path)
             return (
-                "You are a robot command parser. Extract commands from text as JSON.\n"
-                f"Available commands:\n{commands_block}\n"
-                "Respond with valid JSON only."
+                "You are a robot assistant. Use the available tools to execute "
+                "robot commands or fetch information for the user.\n"
+                f"Available commands:\n{commands_block}"
             )
 
-        # --- Inject the commands block ---
+        template = file_path.read_text(encoding="utf-8")
         prompt = template.replace("{{COMMANDS_BLOCK}}", commands_block)
-
         logger.info(
             "system_prompt_built",
             template_path=template_path,
@@ -104,127 +249,325 @@ class LLMAdapter:
         return prompt
 
     # ------------------------------------------------------------------ #
-    #  Inference                                                          #
+    #  Inference                                                           #
     # ------------------------------------------------------------------ #
 
     async def extract_commands(self, text: str) -> CommandBatch:
-        """Send text to llama-server and parse the structured response."""
-        logger.info("llm_inference_start", text_length=len(text))
+        """
+        Command detection only — always runs WITHOUT history so conversational
+        context never biases command recognition.
+        For conversational turns the pipeline calls stream_reply() separately,
+        which handles history injection and streaming.
+        Robot commands never touch history.
+        """
+        return await self._inference_loop(text, inject_history=False)
 
-        # Build the full prompt using Qwen2.5 ChatML format
-        payload: dict = {
-            "prompt": (
-                f"<|im_start|>system\n{self._system_prompt}<|im_end|>\n"
-                f"<|im_start|>user\n{text}<|im_end|>\n"
-                f"<|im_start|>assistant\n"
-            ),
-            "temperature": self._settings.temperature,
-            "n_predict": self._settings.max_tokens,
-            "stop": ["<|im_end|>", "<|endoftext|>"],
-            "stream": False,
-        }
+    async def stream_reply(self, text: str) -> AsyncGenerator[str, None]:
+        """
+        Stream a conversational reply to `text`, injecting history for context.
+        Yields text chunks as they arrive from the LLM.
+        Saves the full exchange to history when the stream is done.
+        """
+        messages = [
+            {"role": "system", "content": self._system_prompt},
+            *self._history,
+            {"role": "user", "content": text},
+        ]
+        full_reply = ""
+        async for chunk in self._stream_chat_completion(messages):
+            full_reply += chunk
+            yield chunk
 
-        if self._grammar:
-            payload["grammar"] = self._grammar
+        # Save to history after the stream completes
+        if full_reply:
+            self._history.append({"role": "user", "content": text})
+            self._history.append({"role": "assistant", "content": full_reply})
+            if len(self._history) > self._max_history_msgs:
+                del self._history[:len(self._history) - self._max_history_msgs]
 
-        try:
-            response = await self._client.post("/completion", json=payload)
-            response.raise_for_status()
-            result = response.json()
-            content = result.get("content", "").strip()
+    async def _inference_loop(self, text: str, inject_history: bool) -> CommandBatch:
+        """Run the tool-calling loop and return a CommandBatch."""
+        messages: list[dict] = [
+            {"role": "system", "content": self._system_prompt},
+            *(self._history if inject_history else []),
+            {"role": "user", "content": text},
+        ]
+        pending_robot_cmds: list[SimpleCommand | ConditionalCommand] = []
+        _robot_tool_names = {"execute_commands", "conditional"}
+        had_data_tool = False  # True when at least one data tool was executed
 
-            logger.info(
-                "llm_inference_complete",
-                tokens_predicted=result.get("tokens_predicted", 0),
-                tokens_evaluated=result.get("tokens_evaluated", 0),
-            )
+        for _round in range(_MAX_TOOL_ROUNDS):
+            response = await self._chat_completion(messages)
+            if response is None:
+                break
 
-            return self._parse_response(content)
+            choice = response["choices"][0]
+            assistant_msg = choice["message"]
+            tool_calls = assistant_msg.get("tool_calls") or []
 
-        except httpx.TimeoutException:
-            logger.error("llm_timeout", timeout=self._settings.timeout)
-            return CommandBatch(
-                is_conversation=True,
-                conversation_response="I'm sorry, I took too long to process. Please try again.",
-            )
-        except httpx.HTTPStatusError as exc:
-            logger.error("llm_http_error", status=exc.response.status_code)
-            return CommandBatch(
-                is_conversation=True,
-                conversation_response="I'm having trouble right now. Please try again.",
-            )
-        except Exception as exc:
-            logger.error("llm_unexpected_error", error=str(exc))
-            return CommandBatch(
-                is_conversation=True,
-                conversation_response="An unexpected error occurred. Please try again.",
-            )
-
-    # ------------------------------------------------------------------ #
-    #  Response parsing                                                   #
-    # ------------------------------------------------------------------ #
-
-    def _parse_response(self, content: str) -> CommandBatch:
-        """Parse LLM JSON response into a validated CommandBatch."""
-        try:
-            data = json.loads(content)
-        except json.JSONDecodeError:
-            logger.warning("llm_invalid_json", content=content[:200])
-            return CommandBatch(
-                is_conversation=True,
-                conversation_response="I couldn't understand that. Could you rephrase?",
-            )
-
-        commands = []
-        for cmd_data in data.get("commands", []):
-            if cmd_data.get("command") == "conditional":
-                then_cmds = [
-                    SimpleCommand(**tc) for tc in cmd_data.get("then_commands", [])
-                ]
-                else_cmds = (
-                    [SimpleCommand(**ec) for ec in cmd_data["else_commands"]]
-                    if cmd_data.get("else_commands")
-                    else None
+            if not tool_calls:
+                content = (assistant_msg.get("content") or "").strip()
+                if pending_robot_cmds:
+                    return CommandBatch(commands=pending_robot_cmds, is_conversation=False)
+                return CommandBatch(
+                    is_conversation=True,
+                    conversation_response=content or "I didn't understand that. Could you rephrase?",
+                    tool_response=had_data_tool,
                 )
-                commands.append(
-                    ConditionalCommand(
-                        condition=cmd_data.get("condition", ""),
-                        then_commands=then_cmds,
-                        else_commands=else_cmds,
-                    )
-                )
-            else:
-                commands.append(SimpleCommand(**cmd_data))
 
-        # Validate: only keep commands that exist in our definitions
-        valid_names = {d.name for d in self._command_defs} | {"conditional"}
-        validated = []
-        for cmd in commands:
-            if isinstance(cmd, ConditionalCommand):
-                cmd.then_commands = [
-                    c for c in cmd.then_commands if c.command in valid_names
-                ]
-                if cmd.else_commands:
-                    cmd.else_commands = [
-                        c for c in cmd.else_commands if c.command in valid_names
-                    ]
-                if cmd.then_commands:
-                    validated.append(cmd)
-            elif cmd.command in valid_names:
-                validated.append(cmd)
-            else:
-                logger.warning("llm_unknown_command_filtered", command=cmd.command)
+            messages.append(assistant_msg)
 
-        is_conversation = data.get("is_conversation", False) or len(validated) == 0
+            for tc in tool_calls:
+                name = tc["function"]["name"]
+                try:
+                    args = json.loads(tc["function"]["arguments"])
+                except json.JSONDecodeError:
+                    args = {}
+
+                if name == "execute_commands":
+                    for item in args.get("commands", []):
+                        cmd_name = item.get("command", "")
+                        if cmd_name not in self._robot_command_names:
+                            logger.warning("execute_commands_unknown", command=cmd_name)
+                            continue
+                        cmd_def = self._cmd_lookup[cmd_name]
+                        pending_robot_cmds.append(
+                            SimpleCommand(
+                                command=cmd_name,
+                                data_type=cmd_def.slots_type[0] if cmd_def.slots_type else "",
+                                data=item.get("data", ""),
+                            )
+                        )
+                        logger.info("robot_command_queued", command=cmd_name, data=item.get("data", ""))
+                    messages.append({"role": "tool", "tool_call_id": tc["id"], "content": '{"status": "queued"}'})
+
+                elif name == "conditional":
+                    cond_cmd = self._parse_conditional_tool(args)
+                    if cond_cmd:
+                        pending_robot_cmds.append(cond_cmd)
+                        logger.info(
+                            "conditional_command_queued",
+                            condition=cond_cmd.condition,
+                            n_then=len(cond_cmd.then_commands),
+                            n_else=len(cond_cmd.else_commands) if cond_cmd.else_commands else 0,
+                        )
+                    messages.append({"role": "tool", "tool_call_id": tc["id"], "content": '{"status": "queued"}'})
+
+                else:
+                    result = await self._execute_data_tool(name, args)
+                    messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+                    logger.info("data_tool_executed", tool=name, result_length=len(result))
+                    had_data_tool = True
+
+            if all(tc["function"]["name"] in _robot_tool_names for tc in tool_calls):
+                return CommandBatch(commands=pending_robot_cmds, is_conversation=False)
+
+        logger.error("llm_tool_loop_exhausted", rounds=_MAX_TOOL_ROUNDS)
+        if pending_robot_cmds:
+            return CommandBatch(commands=pending_robot_cmds, is_conversation=False)
         return CommandBatch(
-            commands=validated,
-            is_conversation=is_conversation,
-            conversation_response=data.get("conversation_response"),
+            is_conversation=True,
+            conversation_response="I'm having trouble right now. Please try again.",
         )
 
     # ------------------------------------------------------------------ #
-    #  Health & lifecycle                                                 #
+    #  HTTP call                                                           #
     # ------------------------------------------------------------------ #
+
+    async def _chat_completion(self, messages: list[dict]) -> dict | None:
+        """POST to /v1/chat/completions and return the parsed JSON response."""
+        payload = {
+            "model": self._settings.model,
+            "messages": messages,
+            "tools": self._tools,
+            "temperature": self._settings.temperature,
+            "max_tokens": self._settings.max_tokens,
+        }
+        try:
+            response = await self._client.post("/v1/chat/completions", json=payload)
+            response.raise_for_status()
+            result = response.json()
+            usage = result.get("usage", {})
+            choice = result.get("choices", [{}])[0].get("message", {})
+            logger.debug(
+                "llm_raw_response",
+                content=choice.get("content"),
+                tool_calls=choice.get("tool_calls"),
+            )
+            logger.info(
+                "llm_inference_complete",
+                prompt_tokens=usage.get("prompt_tokens", 0),
+                completion_tokens=usage.get("completion_tokens", 0),
+            )
+            return result
+        except httpx.TimeoutException:
+            logger.error("llm_timeout", timeout=self._settings.timeout)
+            return None
+        except httpx.HTTPStatusError as exc:
+            logger.error("llm_http_error", status=exc.response.status_code)
+            return None
+        except Exception as exc:
+            logger.error("llm_unexpected_error", error=str(exc))
+            return None
+
+    async def _stream_chat_completion(self, messages: list[dict]) -> AsyncGenerator[str, None]:
+        """POST to /v1/chat/completions with stream=True and yield text chunks."""
+        payload = {
+            "model": self._settings.model,
+            "messages": messages,
+            "tools": self._tools,
+            "temperature": self._settings.temperature,
+            "max_tokens": self._settings.max_tokens,
+            "stream": True,
+        }
+        try:
+            async with self._client.stream("POST", "/v1/chat/completions", json=payload) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data_str = line[6:]
+                    if data_str.strip() == "[DONE]":
+                        break
+                    try:
+                        data = json.loads(data_str)
+                        content = data["choices"][0]["delta"].get("content") or ""
+                        if content:
+                            yield content
+                    except (json.JSONDecodeError, KeyError, IndexError):
+                        continue
+        except httpx.TimeoutException:
+            logger.error("llm_stream_timeout")
+        except httpx.HTTPStatusError as exc:
+            logger.error("llm_stream_http_error", status=exc.response.status_code)
+        except Exception as exc:
+            logger.error("llm_stream_unexpected_error", error=str(exc))
+
+    # ------------------------------------------------------------------ #
+    #  Conditional command parsing                                         #
+    # ------------------------------------------------------------------ #
+
+    def _parse_conditional_tool(self, args: dict) -> ConditionalCommand | None:
+        """Convert the 'conditional' tool call arguments into a ConditionalCommand."""
+        condition = (args.get("condition") or "").strip()
+        if not condition:
+            logger.warning("conditional_missing_condition")
+            return None
+
+        def _parse_sub_cmds(raw: list) -> list[SimpleCommand]:
+            result = []
+            for item in raw:
+                name = item.get("command", "")
+                if name not in self._robot_command_names:
+                    logger.warning("conditional_unknown_sub_command", command=name)
+                    continue
+                cmd_def = self._cmd_lookup[name]
+                result.append(
+                    SimpleCommand(
+                        command=name,
+                        data_type=cmd_def.slots_type[0] if cmd_def.slots_type else "",
+                        data=item.get("data", ""),
+                    )
+                )
+            return result
+
+        then_cmds = _parse_sub_cmds(args.get("then_commands") or [])
+        if not then_cmds:
+            logger.warning("conditional_empty_then_commands")
+            return None
+
+        else_raw = args.get("else_commands") or []
+        else_cmds = _parse_sub_cmds(else_raw) if else_raw else None
+
+        return ConditionalCommand(
+            condition=condition,
+            then_commands=then_cmds,
+            else_commands=else_cmds,
+        )
+
+    # ------------------------------------------------------------------ #
+    #  Data tool execution                                                 #
+    # ------------------------------------------------------------------ #
+
+    async def _execute_data_tool(self, name: str, args: dict) -> str:
+        """Execute a data tool and return the result as a plain string."""
+        if name == "get_weather":
+            return await self._get_weather(args.get("location", ""))
+        if name == "get_time":
+            return self._get_time()
+        if name == "get_news":
+            return await self._get_news(args.get("query", ""))
+        logger.warning("unknown_data_tool", tool=name)
+        return f"Tool '{name}' is not implemented."
+
+    @staticmethod
+    def _get_time() -> str:
+        """Return the current local date and time as a plain string."""
+        return datetime.now().strftime("%A, %B %d %Y, %H:%M")
+
+    @staticmethod
+    async def _get_news(query: str = "") -> str:
+        """Fetch headlines from Google News RSS (free, no API key, supports any search term)."""
+        import xml.etree.ElementTree as ET
+        from urllib.parse import quote
+
+        if query:
+            url = f"https://news.google.com/rss/search?q={quote(query)}&hl=en&gl=US&ceid=US:en"
+        else:
+            url = "https://news.google.com/rss?hl=en&gl=US&ceid=US:en"
+
+        try:
+            async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+                resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+                resp.raise_for_status()
+
+            root = ET.fromstring(resp.text)
+            items = (root.find("channel") or root).findall("item")[:5]
+            headlines = []
+            for item in items:
+                title = item.findtext("title", "").strip()
+                # Google News appends " - Source Name"; strip it for cleaner output
+                if " - " in title:
+                    title = title.rsplit(" - ", 1)[0].strip()
+                if title:
+                    headlines.append(title)
+
+            if not headlines:
+                return "No headlines available right now."
+
+            label = f"news about '{query}'" if query else "top headlines"
+            return f"Latest {label}:\n" + "\n".join(f"- {h}" for h in headlines)
+
+        except Exception as exc:
+            logger.warning("news_fetch_error", query=query, error=str(exc))
+            return "News is currently unavailable."
+
+    @staticmethod
+    async def _get_weather(location: str) -> str:
+        """Fetch current weather from wttr.in (no API key required)."""
+        if not location:
+            return "No location provided."
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(
+                    f"https://wttr.in/{location}",
+                    params={"format": "%C, %t"},
+                    headers={"Accept": "text/plain"},
+                )
+                resp.raise_for_status()
+                return resp.text.strip()
+        except Exception as exc:
+            logger.warning("weather_fetch_error", location=location, error=str(exc))
+            return f"Weather data for '{location}' is currently unavailable."
+
+    # ------------------------------------------------------------------ #
+    #  Health & lifecycle                                                  #
+    # ------------------------------------------------------------------ #
+
+    def clear_history(self) -> None:
+        """Clear the conversation history."""
+        self._history.clear()
+        logger.info("history_cleared")
 
     async def health_check(self) -> bool:
         """Check if llama-server is responding."""

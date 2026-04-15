@@ -36,7 +36,10 @@
                 "register",
                 "registered",
                 "signin",
-                "sign in"
+                "sign in",
+                "log in",
+                "login",
+                "log on"
             ],
             "n_slots": 0,
             "slots_type": []

@@ -28,8 +28,8 @@ if [ ! -f "$MODEL" ]; then
 fi
 
 # Ensure MAXN power mode and clocks locked
-sudo nvpmodel -m 0 2>/dev/null || true
-sudo jetson_clocks 2>/dev/null || true
+# sudo nvpmodel -m 0 2>/dev/null || true
+# sudo jetson_clocks 2>/dev/null || true
 
 echo "Starting llama-server..."
 echo "  Model:   $MODEL"

@@ -41,9 +41,10 @@ class LLMSettings(BaseSettings):
     model: str = "qwen2.5-7b-instruct"
     timeout: float = 30.0
     max_tokens: int = 1024
-    temperature: float = 0.1
+    temperature: float = 0.7
     grammar_path: str = "grammars/commands.gbnf"
     system_prompt_path: str = "data/system_prompt.txt"
+    max_history_pairs: int = 10  # max conversational turns to keep in context
 
 
 class AppSettings(BaseSettings):

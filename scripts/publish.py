@@ -29,6 +29,7 @@ async def main(broker: str, robot_id: str, timeout: int) -> None:
     input_topic = f"robot/{robot_id}/input/text"
     commands_topic = f"robot/{robot_id}/commands/parsed"
     chat_topic = f"robot/{robot_id}/chat/response"
+    stream_topic = f"robot/{robot_id}/chat/stream"
 
     print(f"Broker:   {broker}:1883")
     print(f"Robot:    {robot_id}")
@@ -39,12 +40,14 @@ async def main(broker: str, robot_id: str, timeout: int) -> None:
         # Subscribe to all response topics for this robot
         await client.subscribe(f"{commands_topic}/#")
         await client.subscribe(f"{chat_topic}/#")
+        await client.subscribe(f"{stream_topic}/#")
 
-        async def _recv(tid: str) -> None:
+        async def _recv(tid: str, first_msg_event: asyncio.Event) -> None:
             async for message in client.messages:
                 topic = str(message.topic)
                 if tid not in topic:
                     continue
+                first_msg_event.set()  # first relevant message arrived — disable initial timeout
                 data = json.loads(message.payload.decode())
                 if "commands" in topic:
                     cmds = data.get("commands", [])
@@ -63,15 +66,31 @@ async def main(broker: str, robot_id: str, timeout: int) -> None:
                             slot = f" | {cmd['data_type']}={cmd['data']}" if cmd.get("data") else ""
                             uid = f" (user_id={cmd['user_id']})" if cmd.get("user_id") else ""
                             print(f"[command]      {cmd['command']}{slot}{uid}")
+                    return
+                elif "stream" in topic:
+                    chunk = data.get("chunk", "")
+                    done = data.get("done", False)
+                    if not done:
+                        print(chunk, end="", flush=True)
+                    else:
+                        print()  # newline after stream ends
+                        return
                 else:
                     print(f"[conversation] {data.get('response', '')}")
-                return
+                    return
 
         async def listen_for_response(tid: str) -> None:
+            first_msg_event = asyncio.Event()
+            recv_task = asyncio.create_task(_recv(tid, first_msg_event))
             try:
-                await asyncio.wait_for(_recv(tid), timeout=timeout)
+                # Only the wait for the first message is time-limited
+                await asyncio.wait_for(first_msg_event.wait(), timeout=timeout)
             except asyncio.TimeoutError:
+                recv_task.cancel()
                 print(f"[timeout]      no response after {timeout}s — is the controller running?")
+                return
+            # First message arrived — wait for the full response with no timeout
+            await recv_task
 
         loop = asyncio.get_event_loop()
 

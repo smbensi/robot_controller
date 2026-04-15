@@ -91,17 +91,27 @@ class CommandPipeline:
         logger.info("processing_start", tid=message.transaction_id, text=message.text[:100])
 
         # 1. LLM inference (serialized via semaphore)
+        # Timeout is handled per-request by the httpx client inside LLMAdapter.
+        # wait_for is intentionally omitted here: conversational turns now make
+        # two LLM calls (command detection + history-aware reply), so a single
+        # fixed timeout would fire prematurely on slow hardware (e.g. Jetson).
         async with self._llm_semaphore:
-            batch = await asyncio.wait_for(
-                self._llm.extract_commands(message.text),
-                timeout=self._settings.llm.timeout,
-            )
+            batch = await self._llm.extract_commands(message.text)
 
-        # 2. If conversational, publish chat and return
+        # 2. If conversational, publish the response
         if batch.is_conversation:
-            response_text = batch.conversation_response or "I didn't understand that."
-            await self._mqtt.publish_chat(message.transaction_id, response_text)
-            logger.info("conversation_response", tid=message.transaction_id)
+            if batch.tool_response and batch.conversation_response:
+                # Response was built from a data tool result (news, weather, time…).
+                # Use it directly — calling stream_reply would make a fresh LLM call
+                # without the tool context and produce a wrong/empty answer.
+                await self._mqtt.publish_chat(message.transaction_id, batch.conversation_response)
+                logger.info("tool_response_published", tid=message.transaction_id)
+            else:
+                # Pure conversation — use streaming history-aware reply
+                async for chunk in self._llm.stream_reply(message.text):
+                    await self._mqtt.publish_chat_chunk(message.transaction_id, chunk)
+                await self._mqtt.publish_chat_chunk(message.transaction_id, "", done=True)
+                logger.info("conversation_streamed", tid=message.transaction_id)
             return
 
         # 3. Entity resolution — abort with a user-facing message on any resolution failure
@@ -121,10 +131,7 @@ class CommandPipeline:
             if exc.unknown_type:
                 msg = f"I don't know how to look up '{exc.slot_type}'."
             else:
-                msg = (
-                    f"I couldn't find '{exc.name}' in the {exc.slot_type} list. "
-                    "Please check the name and try again."
-                )
+                msg = f"I couldn't find '{exc.name}'."
             logger.warning("entity_not_found_response", slot_type=exc.slot_type, name=exc.name)
             await self._mqtt.publish_chat(message.transaction_id, msg)
             return

@@ -58,6 +58,10 @@ class CommandBatch(BaseModel):
     commands: List[SimpleCommand | ConditionalCommand] = Field(default_factory=list)
     is_conversation: bool = False
     conversation_response: Optional[str] = None
+    # True when conversation_response was built from a data tool result (weather,
+    # news, time, …).  The pipeline uses it directly instead of calling stream_reply,
+    # which would make a fresh LLM call without the tool context.
+    tool_response: bool = False
 
 
 class ParsedMessage(BaseModel):
