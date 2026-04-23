@@ -164,6 +164,17 @@ class TestExtractCommands:
         assert {c.command for c in batch.commands} == {"photo", "vitals"}
 
     @pytest.mark.asyncio
+    async def test_text_tool_call_fallback(self, adapter):
+        """Qwen produces execute_commands as plain text — must be parsed as a real command."""
+        with patch.object(adapter, "_chat_completion", new_callable=AsyncMock) as m:
+            m.return_value = _text_response('execute_commands([{command:"call", data:"Jake"}])')
+            batch = await adapter.extract_commands("call Jake")
+        assert not batch.is_conversation
+        assert len(batch.commands) == 1
+        assert batch.commands[0].command == "call"
+        assert batch.commands[0].data == "Jake"
+
+    @pytest.mark.asyncio
     async def test_goto_and_call_in_one_call(self, adapter):
         """Regression: 'go to home and call Jake' must produce both commands."""
         # Add goto to a fresh adapter for this test

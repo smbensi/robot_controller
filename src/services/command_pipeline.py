@@ -91,32 +91,50 @@ class CommandPipeline:
         logger.info("processing_start", tid=message.transaction_id, text=message.text[:100])
 
         # 1. LLM inference (serialized via semaphore)
-        # Timeout is handled per-request by the httpx client inside LLMAdapter.
-        # wait_for is intentionally omitted here: conversational turns now make
-        # two LLM calls (command detection + history-aware reply), so a single
-        # fixed timeout would fire prematurely on slow hardware (e.g. Jetson).
         async with self._llm_semaphore:
             batch = await self._llm.extract_commands(message.text)
 
-        # 2. If conversational, publish the response
+        # 2. Conversational turn
         if batch.is_conversation:
             if batch.tool_response and batch.conversation_response:
-                # Response was built from a data tool result (news, weather, time…).
-                # Use it directly — calling stream_reply would make a fresh LLM call
-                # without the tool context and produce a wrong/empty answer.
+                # Response already enriched by a data tool (weather, news, …) — use directly.
                 await self._mqtt.publish_chat(message.transaction_id, batch.conversation_response)
                 logger.info("tool_response_published", tid=message.transaction_id)
-            else:
-                # Pure conversation — use streaming history-aware reply
-                async for chunk in self._llm.stream_reply(message.text):
-                    await self._mqtt.publish_chat_chunk(message.transaction_id, chunk)
-                await self._mqtt.publish_chat_chunk(message.transaction_id, "", done=True)
-                logger.info("conversation_streamed", tid=message.transaction_id)
+                return
+
+            # Collect the full stream_reply before publishing so we can intercept
+            # text-format tool calls (Qwen sometimes writes execute_commands(…) as
+            # plain text instead of a structured call).
+            full_reply = ""
+            async for chunk in self._llm.stream_reply(message.text):
+                full_reply += chunk
+
+            fallback = self._llm._try_parse_text_tool_call(full_reply) if full_reply else None
+            if fallback:
+                logger.warning(
+                    "stream_reply_text_tool_call_intercepted",
+                    tid=message.transaction_id,
+                    preview=full_reply[:80],
+                )
+                await self._dispatch_commands(fallback, message)
+                return
+
+            if full_reply:
+                await self._mqtt.publish_chat(message.transaction_id, full_reply)
+            logger.info("conversation_published", tid=message.transaction_id)
             return
 
-        # 3. Entity resolution — abort with a user-facing message on any resolution failure
+        # 3. Command turn
+        await self._dispatch_commands(batch.commands, message)
+
+    async def _dispatch_commands(
+        self,
+        commands: List[SimpleCommand | ConditionalCommand],
+        message: ParsedMessage,
+    ) -> None:
+        """Entity resolution + MQTT publish for a list of commands."""
         try:
-            for cmd in batch.commands:
+            for cmd in commands:
                 await self._resolve_entities(cmd)
         except AmbiguousEntityError as exc:
             names = ", ".join(exc.matches)
@@ -136,9 +154,8 @@ class CommandPipeline:
             await self._mqtt.publish_chat(message.transaction_id, msg)
             return
 
-        # 4. Build and publish response
         commands_dicts = []
-        for cmd in batch.commands:
+        for cmd in commands:
             if isinstance(cmd, ConditionalCommand):
                 commands_dicts.append({
                     "command": "conditional",
@@ -159,13 +176,8 @@ class CommandPipeline:
             robot_id=message.robot_id,
             commands=commands_dicts,
         )
-
         await self._mqtt.publish_commands(response)
-        logger.info(
-            "processing_complete",
-            tid=message.transaction_id,
-            n_commands=len(batch.commands),
-        )
+        logger.info("processing_complete", tid=message.transaction_id, n_commands=len(commands))
 
     async def _resolve_entities(self, cmd: SimpleCommand | ConditionalCommand) -> None:
         """Resolve entity references in a command using MongoDB."""

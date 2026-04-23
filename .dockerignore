@@ -1,0 +1,17 @@
+.venv
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+tests/
+docs/
+*.md
+.env
+.git
+.gitignore
+uv.lock
+scripts/
+xtend_mongodb/
+dataset/

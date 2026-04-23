@@ -67,6 +67,23 @@ _DATA_TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "calculate",
+            "description": "Evaluate a mathematical expression and return the result. Use for any arithmetic or math question.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "expression": {
+                        "type": "string",
+                        "description": "Math expression to evaluate, e.g. '2 + 2', 'sqrt(144)', '15 % 4'.",
+                    }
+                },
+                "required": ["expression"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_news",
             "description": (
                 "Get the latest news headlines. "
@@ -309,6 +326,13 @@ class LLMAdapter:
                 content = (assistant_msg.get("content") or "").strip()
                 if pending_robot_cmds:
                     return CommandBatch(commands=pending_robot_cmds, is_conversation=False)
+                # Fallback: Qwen sometimes produces tool calls as plain text instead
+                # of structured tool calls (e.g. `execute_commands([{command:"call"…}])`).
+                # Try to parse and execute them before falling back to conversation.
+                fallback = self._try_parse_text_tool_call(content)
+                if fallback:
+                    logger.warning("text_tool_call_fallback", content_preview=content[:80])
+                    return CommandBatch(commands=fallback, is_conversation=False)
                 return CommandBatch(
                     is_conversation=True,
                     conversation_response=content or "I didn't understand that. Could you rephrase?",
@@ -444,6 +468,58 @@ class LLMAdapter:
             logger.error("llm_stream_unexpected_error", error=str(exc))
 
     # ------------------------------------------------------------------ #
+    #  Text tool-call fallback parser                                      #
+    # ------------------------------------------------------------------ #
+
+    def _try_parse_text_tool_call(
+        self, content: str
+    ) -> list[SimpleCommand | ConditionalCommand] | None:
+        """
+        Qwen occasionally produces tool calls as plain text instead of structured
+        tool calls, e.g.:
+            execute_commands([{command:"call", data:"Jake"}])
+        This method detects that pattern, normalises it to valid JSON, and returns
+        the parsed commands.  Returns None if the content doesn't match or parsing
+        fails.
+        """
+        import re
+
+        match = re.search(
+            r"execute_commands\s*\(\s*\[(.+?)\]\s*\)",
+            content,
+            re.DOTALL | re.IGNORECASE,
+        )
+        if not match:
+            return None
+
+        raw = "[" + match.group(1) + "]"
+        # Normalise JS-style unquoted keys → valid JSON keys
+        raw = re.sub(r'(?<=[{,\s])(\w+)(?=\s*:)', r'"\1"', raw)
+        # Normalise single-quoted strings → double-quoted
+        raw = raw.replace("'", '"')
+
+        try:
+            items: list[dict] = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+
+        cmds: list[SimpleCommand | ConditionalCommand] = []
+        for item in items:
+            cmd_name = item.get("command", "")
+            if cmd_name not in self._robot_command_names:
+                logger.warning("text_fallback_unknown_command", command=cmd_name)
+                continue
+            cmd_def = self._cmd_lookup[cmd_name]
+            cmds.append(
+                SimpleCommand(
+                    command=cmd_name,
+                    data_type=cmd_def.slots_type[0] if cmd_def.slots_type else "",
+                    data=item.get("data", ""),
+                )
+            )
+        return cmds or None
+
+    # ------------------------------------------------------------------ #
     #  Conditional command parsing                                         #
     # ------------------------------------------------------------------ #
 
@@ -495,10 +571,67 @@ class LLMAdapter:
             return await self._get_weather(args.get("location", ""))
         if name == "get_time":
             return self._get_time()
+        if name == "calculate":
+            return self._calculate(args.get("expression", ""))
         if name == "get_news":
             return await self._get_news(args.get("query", ""))
         logger.warning("unknown_data_tool", tool=name)
         return f"Tool '{name}' is not implemented."
+
+    @staticmethod
+    def _calculate(expression: str) -> str:
+        """Safely evaluate a math expression using ast — no exec/eval on arbitrary code."""
+        import ast
+        import math
+        import operator
+
+        _OPERATORS = {
+            ast.Add: operator.add,
+            ast.Sub: operator.sub,
+            ast.Mult: operator.mul,
+            ast.Div: operator.truediv,
+            ast.FloorDiv: operator.floordiv,
+            ast.Mod: operator.mod,
+            ast.Pow: operator.pow,
+            ast.USub: operator.neg,
+            ast.UAdd: operator.pos,
+        }
+        _FUNCTIONS = {
+            "abs": abs, "round": round,
+            "sqrt": math.sqrt, "ceil": math.ceil, "floor": math.floor,
+            "log": math.log, "log2": math.log2, "log10": math.log10,
+            "sin": math.sin, "cos": math.cos, "tan": math.tan,
+            "asin": math.asin, "acos": math.acos, "atan": math.atan,
+            "exp": math.exp, "factorial": math.factorial,
+        }
+        _CONSTANTS = {"pi": math.pi, "e": math.e, "tau": math.tau, "inf": math.inf}
+
+        def _eval(node: ast.expr):
+            if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+                return node.value
+            if isinstance(node, ast.Name) and node.id in _CONSTANTS:
+                return _CONSTANTS[node.id]
+            if isinstance(node, ast.BinOp) and type(node.op) in _OPERATORS:
+                return _OPERATORS[type(node.op)](_eval(node.left), _eval(node.right))
+            if isinstance(node, ast.UnaryOp) and type(node.op) in _OPERATORS:
+                return _OPERATORS[type(node.op)](_eval(node.operand))
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _FUNCTIONS:
+                return _FUNCTIONS[node.func.id](*(_eval(a) for a in node.args))
+            raise ValueError(f"Unsupported expression: {ast.dump(node)}")
+
+        if not expression:
+            return "No expression provided."
+        try:
+            tree = ast.parse(expression.strip(), mode="eval")
+            result = _eval(tree.body)
+            # Format: drop .0 for whole numbers
+            if isinstance(result, float) and result.is_integer():
+                return f"{expression} = {int(result)}"
+            return f"{expression} = {result}"
+        except ZeroDivisionError:
+            return "Division by zero."
+        except Exception as exc:
+            return f"Could not evaluate '{expression}': {exc}"
 
     @staticmethod
     def _get_time() -> str:

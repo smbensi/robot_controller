@@ -1,0 +1,36 @@
+services:
+  robot-controller:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: robot-controller:latest
+    restart: unless-stopped
+    network_mode: host        # simplest on Jetson — shares host's MQTT/LLM ports directly
+    environment:
+      # App
+      APP_ROBOT_ID: ${APP_ROBOT_ID:-robot-01}
+      APP_LOG_FORMAT: ${APP_LOG_FORMAT:-json}
+
+      # LLM (llama-server running on host, same machine)
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://127.0.0.1:8080}
+      LLM_MODEL: ${LLM_MODEL:-qwen2.5-7b-instruct}
+      LLM_TIMEOUT: ${LLM_TIMEOUT:-30.0}
+      LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0.7}
+
+      # MQTT
+      MQTT_HOST: ${MQTT_HOST:-127.0.0.1}
+      MQTT_PORT: ${MQTT_PORT:-1883}
+      MQTT_USERNAME: ${MQTT_USERNAME:-}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:-}
+
+      # MongoDB
+      MONGO_URI: ${MONGO_URI:-mongodb://127.0.0.1:27017}
+      MONGO_DATABASE: ${MONGO_DATABASE:-xtend_robotics}
+    volumes:
+      # Mount data/ so you can update commands.json / system_prompt.txt without rebuilding
+      - ./data:/app/data:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
