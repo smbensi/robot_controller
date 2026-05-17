@@ -20,6 +20,24 @@ from src.utils import get_logger
 
 logger = get_logger(__name__)
 
+_HONORIFICS = frozenset([
+    "dr", "dr.", "doctor",
+    "mr", "mr.", "mister",
+    "mrs", "mrs.", "missus",
+    "ms", "ms.", "miss",
+    "prof", "prof.", "professor",
+    "sir", "madam", "captain", "capt", "capt.",
+    "sergeant", "sgt", "sgt.", "officer",
+])
+
+
+def _strip_honorifics(name: str) -> str:
+    """Remove leading honorifics/titles so 'Doctor Benjamin' resolves to 'Benjamin'."""
+    parts = name.split()
+    while parts and parts[0].lower() in _HONORIFICS:
+        parts = parts[1:]
+    return " ".join(parts) if parts else name
+
 
 class EntityNotFoundError(Exception):
     """Raised when a required entity slot cannot be resolved from MongoDB."""
@@ -134,7 +152,7 @@ class EntityResolver:
         Raises AmbiguousEntityError when multiple users match at any tier.
         Raises EntityNotFoundError when no match is found at all.
         """
-        name = name.strip()
+        name = _strip_honorifics(name.strip())
         parts = name.split()
 
         # --- Tier 1: full name match (two words, either order) ---

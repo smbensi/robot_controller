@@ -66,6 +66,19 @@ async def main(broker: str, robot_id: str, timeout: int) -> None:
                             slot = f" | {cmd['data_type']}={cmd['data']}" if cmd.get("data") else ""
                             uid = f" (user_id={cmd['user_id']})" if cmd.get("user_id") else ""
                             print(f"[command]      {cmd['command']}{slot}{uid}")
+
+                            data_type = cmd.get("data_type", "")
+                            resolved_id_key = f"{data_type.rstrip('s')}_id" if data_type else None
+                            mongo_id = cmd.get(resolved_id_key, "") if resolved_id_key else ""
+                            status = "_SLOT" if data_type and not mongo_id else "VALID"
+                            brain_payload = json.dumps({
+                                "command": cmd["command"],
+                                "data_type": data_type,
+                                "data": mongo_id,
+                                "status": status,
+                            })
+                            await client.publish("/robot/to_brain/general/command", brain_payload, qos=1)
+                            print(f"[brain →]      /robot/to_brain/general/command {brain_payload}")
                     return
                 elif "stream" in topic:
                     chunk = data.get("chunk", "")
@@ -112,6 +125,7 @@ async def main(broker: str, robot_id: str, timeout: int) -> None:
                     "text": text,
                     "timestamp": time.time(),
                 })
+                print(f"[publish]      topic={input_topic} payload={payload}")
                 await client.publish(input_topic, payload, qos=1)
                 await listen_for_response(tid)
                 print()

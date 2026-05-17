@@ -343,13 +343,22 @@ class LLMAdapter:
 
             for tc in tool_calls:
                 name = tc["function"]["name"]
+                raw_args = tc["function"]["arguments"]
                 try:
-                    args = json.loads(tc["function"]["arguments"])
-                except json.JSONDecodeError:
+                    args = raw_args if isinstance(raw_args, dict) else json.loads(raw_args)
+                except (json.JSONDecodeError, TypeError):
                     args = {}
 
                 if name == "execute_commands":
-                    for item in args.get("commands", []):
+                    items = args.get("commands", [])
+                    if not items:
+                        # Model signalled execute_commands but generated empty arguments —
+                        # common with quantized models. Fall back to spelling match.
+                        items = self._spelling_match(text)
+                        if items:
+                            logger.warning("execute_commands_empty_args_spelling_fallback",
+                                           matched=[i["command"] for i in items])
+                    for item in items:
                         cmd_name = item.get("command", "")
                         if cmd_name not in self._robot_command_names:
                             logger.warning("execute_commands_unknown", command=cmd_name)
@@ -471,53 +480,72 @@ class LLMAdapter:
     #  Text tool-call fallback parser                                      #
     # ------------------------------------------------------------------ #
 
+    def _spelling_match(self, text: str) -> list[dict]:
+        """Match user text against command spellings; returns items in execute_commands format."""
+        text_lower = text.lower()
+        for cmd_def in self._command_defs:
+            for spelling in cmd_def.spellings:
+                if spelling.lower() in text_lower:
+                    return [{"command": cmd_def.name, "data": ""}]
+        return []
+
     def _try_parse_text_tool_call(
         self, content: str
     ) -> list[SimpleCommand | ConditionalCommand] | None:
         """
-        Qwen occasionally produces tool calls as plain text instead of structured
-        tool calls, e.g.:
+        Qwen/MLC occasionally produces tool calls as plain text instead of structured
+        tool calls. Two known formats:
             execute_commands([{command:"call", data:"Jake"}])
-        This method detects that pattern, normalises it to valid JSON, and returns
-        the parsed commands.  Returns None if the content doesn't match or parsing
-        fails.
+            call data="Jake"
+        Returns None if the content doesn't match or parsing fails.
         """
         import re
 
+        # Format 1: execute_commands([{command:"...", data:"..."}])
         match = re.search(
             r"execute_commands\s*\(\s*\[(.+?)\]\s*\)",
             content,
             re.DOTALL | re.IGNORECASE,
         )
-        if not match:
-            return None
-
-        raw = "[" + match.group(1) + "]"
-        # Normalise JS-style unquoted keys → valid JSON keys
-        raw = re.sub(r'(?<=[{,\s])(\w+)(?=\s*:)', r'"\1"', raw)
-        # Normalise single-quoted strings → double-quoted
-        raw = raw.replace("'", '"')
-
-        try:
-            items: list[dict] = json.loads(raw)
-        except json.JSONDecodeError:
-            return None
-
-        cmds: list[SimpleCommand | ConditionalCommand] = []
-        for item in items:
-            cmd_name = item.get("command", "")
-            if cmd_name not in self._robot_command_names:
-                logger.warning("text_fallback_unknown_command", command=cmd_name)
-                continue
-            cmd_def = self._cmd_lookup[cmd_name]
-            cmds.append(
-                SimpleCommand(
-                    command=cmd_name,
-                    data_type=cmd_def.slots_type[0] if cmd_def.slots_type else "",
-                    data=item.get("data", ""),
+        if match:
+            raw = "[" + match.group(1) + "]"
+            raw = re.sub(r'(?<=[{,\s])(\w+)(?=\s*:)', r'"\1"', raw)
+            raw = raw.replace("'", '"')
+            try:
+                items: list[dict] = json.loads(raw)
+            except json.JSONDecodeError:
+                return None
+            cmds: list[SimpleCommand | ConditionalCommand] = []
+            for item in items:
+                cmd_name = item.get("command", "")
+                if cmd_name not in self._robot_command_names:
+                    logger.warning("text_fallback_unknown_command", command=cmd_name)
+                    continue
+                cmd_def = self._cmd_lookup[cmd_name]
+                cmds.append(
+                    SimpleCommand(
+                        command=cmd_name,
+                        data_type=cmd_def.slots_type[0] if cmd_def.slots_type else "",
+                        data=item.get("data", ""),
+                    )
                 )
-            )
-        return cmds or None
+            return cmds or None
+
+        # Format 2: <command_name> [data="<value>"]  — produced by MLC
+        m = re.match(r'^(\w+)(?:\s+data="([^"]*)")?$', content.strip())
+        if m:
+            cmd_name = m.group(1)
+            if cmd_name in self._robot_command_names:
+                cmd_def = self._cmd_lookup[cmd_name]
+                return [
+                    SimpleCommand(
+                        command=cmd_name,
+                        data_type=cmd_def.slots_type[0] if cmd_def.slots_type else "",
+                        data=m.group(2) or "",
+                    )
+                ]
+
+        return None
 
     # ------------------------------------------------------------------ #
     #  Conditional command parsing                                         #

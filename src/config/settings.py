@@ -5,12 +5,14 @@ All values can be overridden via environment variables or .env file.
 
 from __future__ import annotations
 
-from pydantic import Field
+from typing import ClassVar, Literal
+
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class MQTTSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="MQTT_")
+    model_config = SettingsConfigDict(env_prefix="MQTT_", env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     host: str = "127.0.0.1"
     port: int = 1883
@@ -21,8 +23,21 @@ class MQTTSettings(BaseSettings):
     qos: int = 1
 
 
+class MQTT2Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="MQTT2_", env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+    enabled: bool = False
+    host: str = "127.0.0.1"
+    port: int = 1883
+    username: str | None = None
+    password: str | None = None
+    client_id: str = "robot-command-controller-2"
+    keepalive: int = 60
+    qos: int = 1
+
+
 class MongoSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="MONGO_")
+    model_config = SettingsConfigDict(env_prefix="MONGO_", env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     uri: str = "mongodb://127.0.0.1:27017"
     database: str = "xtend_robotics"
@@ -35,16 +50,37 @@ class MongoSettings(BaseSettings):
 
 
 class LLMSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="LLM_")
+    model_config = SettingsConfigDict(env_prefix="LLM_", env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
-    base_url: str = "http://127.0.0.1:8080"
-    model: str = "qwen2.5-7b-instruct"
+    _BACKEND_DEFAULTS: ClassVar[dict] = {
+        "mlc": {
+            "base_url": "http://0.0.0.0:9000",
+            "model": "Qwen2.5-7B-Instruct-q4f16_1-MLC",
+        },
+        "llama": {
+            "base_url": "http://0.0.0.0:8080",
+            "model": "qwen2.5-7b-instruct-q8_0",
+        },
+    }
+
+    backend: Literal["mlc", "llama"] = "mlc"
+    base_url: str = ""
+    model: str = ""
     timeout: float = 30.0
     max_tokens: int = 1024
-    temperature: float = 0.7
+    temperature: float = 0.1
     grammar_path: str = "grammars/commands.gbnf"
     system_prompt_path: str = "data/system_prompt.txt"
     max_history_pairs: int = 10  # max conversational turns to keep in context
+
+    @model_validator(mode="after")
+    def apply_backend_defaults(self) -> "LLMSettings":
+        defaults = self._BACKEND_DEFAULTS[self.backend]
+        if not self.base_url:
+            self.base_url = defaults["base_url"]
+        if not self.model:
+            self.model = defaults["model"]
+        return self
 
 
 class AppSettings(BaseSettings):
@@ -52,6 +88,7 @@ class AppSettings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         env_prefix="APP_",
+        extra="ignore",
     )
 
     robot_id: str = "robot-01"

@@ -4,9 +4,11 @@
 # =============================================================================
 set -euo pipefail
 
-LLAMA_BIN="/opt/llama.cpp/build/bin/llama-server"
-MODEL_FOLDER="${HOME}/models"
-MODEL="${MODEL_FOLDER}/qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf"
+LLAMA_SERVER_FOLDER="/home/nvidia/dev"
+LLAMA_BIN="${LLAMA_SERVER_FOLDER}/llama.cpp/build/bin/llama-server"
+MODEL_FOLDER="${HOME}/dev/models"
+MODEL="${MODEL_FOLDER}/qwen2.5-7b-instruct-q8_0-00001-of-00003.gguf"
+# MODEL="${MODEL_FOLDER}/qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf"
 # MODEL="qwen3-0.6b-q4_k_m.gguf"
 GRAMMAR="$(dirname "$0")/../grammars/commands.gbnf"
 HOST="0.0.0.0"
@@ -58,4 +60,4 @@ exec "$LLAMA_BIN" \
     -c 8192 \
     -t 6 \
     --no-mmap \
-    --log-disable
+    # --log-disable
